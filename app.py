@@ -8,128 +8,121 @@ import time
 import shutil
 import psutil
 from pathlib import Path
-from typing import List, Optional, Dict
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# --- CONFIGURATION ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("HLS-Engine")
+# --- SETUP & LOGGING ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+logger = logging.getLogger("LIVE-ENGINE")
 
 BASE_DIR = Path(__file__).parent
 LIVE_DIR = BASE_DIR / "static" / "live"
 UPLOAD_DIR = BASE_DIR / "static" / "uploads"
-DB_FILE = BASE_DIR / "database.json"
+DB_FILE = BASE_DIR / "db.json"
 
-for folder in [LIVE_DIR, UPLOAD_DIR]:
-    folder.mkdir(parents=True, exist_ok=True)
+for d in [LIVE_DIR, UPLOAD_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
 
 # --- MODELS ---
-class StreamConfig(BaseModel):
-    url: Optional[str] = None
-    group_id: Optional[str] = None
+class StreamRequest(BaseModel):
+    media_id: Optional[str] = None
+    group_name: Optional[str] = None
     loop: bool = True
 
-# --- DATABASE LOGIC ---
-class Database:
-    @staticmethod
-    def load():
-        if not DB_FILE.exists():
-            return {"media": [], "groups": {}}
-        return json.loads(DB_FILE.read_text())
+# --- DATABASE ---
+def load_db():
+    if not DB_FILE.exists(): return {"media": [], "groups": {}}
+    return json.loads(DB_FILE.read_text())
 
-    @staticmethod
-    def save(data):
-        DB_FILE.write_text(json.dumps(data, indent=2))
+def save_db(data):
+    DB_FILE.write_text(json.dumps(data, indent=2))
 
-# --- STREAM MANAGER (The Brain) ---
-class StreamManager:
+# --- THE ENGINE ---
+class LiveStreamEngine:
     def __init__(self):
         self.process = None
         self.playlist = []
-        self.current_index = 0
-        self.is_looping = False
-        self.stop_requested = False
+        self.index = 0
+        self.is_looping = True
+        self.active_title = "IDLE"
+        self.start_time = 0
         self.lock = threading.Lock()
-        self.status = "IDLE"
-        self.current_video_title = "None"
 
-    def stop_ffmpeg(self):
+    def kill_ffmpeg(self):
         with self.lock:
             if self.process:
-                logger.info("Stopping FFmpeg...")
+                logger.info("Killing FFmpeg process...")
                 self.process.terminate()
-                try:
-                    self.process.wait(timeout=3)
-                except:
-                    self.process.kill()
+                try: self.process.wait(timeout=5)
+                except: self.process.kill()
                 self.process = None
-            self.status = "IDLE"
+            self.active_title = "IDLE"
 
-    def start_ffmpeg(self, video_url: str, title: str):
-        self.stop_ffmpeg()
+    def start_ffmpeg(self, source_path, title):
+        self.kill_ffmpeg()
         
-        # Determine if source is local or URL
-        input_source = video_url
-        if not video_url.startswith(("http", "https")):
-            input_source = str(BASE_DIR / video_url)
+        # Determine if it's a URL or local file
+        input_src = source_path
+        if not source_path.startswith(("http", "https")):
+            input_src = str(BASE_DIR / source_path)
 
-        # RENDER OPTIMIZED COMMAND
+        # OPTIMIZED COMMAND FOR RENDER (512MB RAM)
+        # -re: Read input at native frame rate (Essential for True Live)
         cmd = [
-            "ffmpeg", "-re", "-i", input_source,
+            "ffmpeg", "-re", "-i", input_src,
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-b:v", "600k", "-maxrate", "600k", "-bufsize", "1000k", 
-            "-vf", "scale=-2:480", # Downscale to 480p to save RAM
-            "-c:a", "aac", "-ar", "44100", "-b:a", "64k",
-            "-f", "hls", "-hls_time", "4", "-hls_list_size", "3",
+            "-b:v", "700k", "-maxrate", "700k", "-bufsize", "1400k",
+            "-vf", "scale=-2:480", # Scale to 480p to keep CPU/RAM low
+            "-c:a", "aac", "-b:a", "64k", "-ar", "44100",
+            "-f", "hls",
+            "-hls_time", "4", 
+            "-hls_list_size", "6", # Keeps ~24 seconds of buffer
             "-hls_flags", "delete_segments+append_list+discont_start",
             "-hls_segment_filename", str(LIVE_DIR / "seg_%03d.ts"),
-            str(LIVE_DIR / "index.m3u8"), "-y"
+            str(LIVE_DIR / "index.m3u8"),
+            "-y"
         ]
 
         with self.lock:
             self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.status = "LIVE"
-            self.current_video_title = title
-            logger.info(f"Streaming: {title}")
+            self.active_title = title
+            self.start_time = time.time()
+            logger.info(f"LIVE NOW: {title}")
 
-    def skip(self):
-        """Kills current process; the monitor thread will automatically pick up the next video."""
-        logger.info("Skip requested.")
-        self.stop_ffmpeg()
-
-    def monitor_loop(self):
-        """Orchestrates the 24/7 playlist logic."""
+    def monitor_thread(self):
+        """Infinite loop to manage transitions and playlist looping."""
         while True:
-            if not self.stop_requested and self.playlist:
-                # If nothing is playing, start the next one
-                if self.process is None or self.process.poll() is not None:
-                    if self.current_index >= len(self.playlist):
+            if self.playlist:
+                # If FFmpeg is not running (video ended or crashed)
+                if not self.process or self.process.poll() is not None:
+                    if self.index >= len(self.playlist):
                         if self.is_looping:
-                            self.current_index = 0
+                            logger.info("Playlist ended. Looping back to start.")
+                            self.index = 0
                         else:
+                            logger.info("Playlist ended. Stopping.")
                             self.playlist = []
                             continue
                     
-                    video_id = self.playlist[self.current_index]
-                    db = Database.load()
-                    video_data = next((m for m in db["media"] if m["id"] == video_id), None)
+                    db = load_db()
+                    mid = self.playlist[self.index]
+                    media = next((m for m in db["media"] if m["id"] == mid), None)
                     
-                    if video_data:
-                        self.start_ffmpeg(video_data["url"], video_data["title"])
-                        self.current_index += 1
+                    if media:
+                        self.start_ffmpeg(media["url"], media["title"])
+                        self.index += 1
                     else:
-                        self.current_index += 1 # Skip missing files
-            time.sleep(3)
+                        self.index += 1 # Skip if media deleted
+            time.sleep(2)
 
-manager = StreamManager()
+engine = LiveStreamEngine()
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Ultimate HLS Engine")
+app = FastAPI(title="24/7 Live HLS Engine")
 
-# ENABLE CORS (So your React frontend can connect)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -142,82 +135,83 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 @app.on_event("startup")
 def startup():
-    threading.Thread(target=manager.monitor_loop, daemon=True).start()
-    # Disk Cleanup Thread
-    def cleanup():
-        while True:
-            now = time.time()
-            for f in LIVE_DIR.glob("*.ts"):
-                if now - f.stat().st_mtime > 60: f.unlink()
-            time.sleep(30)
-    threading.Thread(target=cleanup, daemon=True).start()
-
-# --- ENDPOINTS ---
-
-@app.get("/health")
-def health(): return {"status": "ok"}
+    threading.Thread(target=engine.monitor_thread, daemon=True).start()
 
 @app.get("/api/status")
 def get_status():
     return {
-        "status": manager.status,
-        "current_video": manager.current_video_title,
-        "playlist_pos": f"{manager.current_index}/{len(manager.playlist)}",
-        "cpu": psutil.cpu_percent(),
-        "ram": psutil.virtual_memory().percent
+        "status": "LIVE" if engine.process and engine.process.poll() is None else "IDLE",
+        "now_playing": engine.active_title,
+        "ram": f"{psutil.virtual_memory().percent}%",
+        "cpu": f"{psutil.cpu_percent()}%",
+        "playlist_index": engine.index
     }
 
 @app.get("/api/media")
-def list_media(): return Database.load()["media"]
+def list_media():
+    return load_db()["media"]
 
 @app.post("/api/upload")
-async def upload_video(file: UploadFile = File(...)):
-    file_path = UPLOAD_DIR / file.filename
-    with file_path.open("wb") as buffer:
+async def upload(file: UploadFile = File(...)):
+    ts = str(int(time.time()))
+    filename = f"{ts}_{file.filename}"
+    path = UPLOAD_DIR / filename
+    
+    with path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    db = Database.load()
-    new_id = str(int(time.time()))
-    db["media"].append({
-        "id": new_id,
+    db = load_db()
+    new_media = {
+        "id": ts,
         "title": file.filename,
-        "url": f"static/uploads/{file.filename}"
-    })
-    Database.save(db)
-    return {"status": "Uploaded", "id": new_id}
+        "url": f"static/uploads/{filename}"
+    }
+    db["media"].append(new_media)
+    save_db(db)
+    return new_media
 
 @app.post("/api/stream/start")
-def start_stream(config: StreamConfig):
-    manager.stop_requested = False
-    if config.group_id:
-        db = Database.load()
-        manager.playlist = db["groups"].get(config.group_id, [])
-        manager.current_index = 0
-        manager.is_looping = config.loop
-        manager.stop_ffmpeg() # Force restart with new playlist
-    elif config.url:
-        manager.playlist = [] 
-        manager.start_ffmpeg(config.url, "Manual URL")
-    return {"message": "Command received"}
+def start(req: StreamRequest):
+    db = load_db()
+    if req.group_name:
+        engine.playlist = db["groups"].get(req.group_name, [])
+        engine.index = 0
+    elif req.media_id:
+        engine.playlist = [req.media_id]
+        engine.index = 0
+    
+    engine.is_looping = req.loop
+    engine.kill_ffmpeg() # Forces monitor to start the new playlist
+    return {"message": "Stream starting..."}
 
 @app.post("/api/stream/stop")
-def stop_all():
-    manager.stop_requested = True
-    manager.playlist = []
-    manager.stop_ffmpeg()
-    return {"message": "Stopped"}
+def stop():
+    engine.playlist = []
+    engine.kill_ffmpeg()
+    return {"message": "Stream stopped"}
 
 @app.post("/api/stream/skip")
-def skip_video():
-    manager.skip()
-    return {"message": "Skipped to next video"}
+def skip():
+    engine.kill_ffmpeg() # Monitor will immediately start the next video
+    return {"message": "Skipping..."}
 
 @app.post("/api/groups")
-def create_group(name: str, video_ids: List[str]):
-    db = Database.load()
-    db["groups"][name] = video_ids
-    Database.save(db)
-    return {"status": "Group Created"}
+def create_group(name: str, ids: List[str]):
+    db = load_db()
+    db["groups"][name] = ids
+    save_db(db)
+    return {"status": "Group saved"}
+
+@app.delete("/api/media/{mid}")
+def delete_media(mid: str):
+    db = load_db()
+    item = next((m for m in db["media"] if m["id"] == mid), None)
+    if item:
+        try: os.remove(BASE_DIR / item["url"])
+        except: pass
+        db["media"] = [m for m in db["media"] if m["id"] != mid]
+        save_db(db)
+    return {"status": "deleted"}
 
 if __name__ == "__main__":
     import uvicorn
