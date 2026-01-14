@@ -6,129 +6,184 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from yt_dlp import YoutubeDL
 
-# --- SETUP ---
+# --- SETUP & LOGGING ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("OVERLORD-ENGINE")
+logger = logging.getLogger("ASHLABS-TITAN")
 
 BASE_DIR = Path(__file__).parent
 LIVE_DIR = BASE_DIR / "static/live"
 UPLOAD_DIR = BASE_DIR / "static/uploads"
 DB_FILE = BASE_DIR / "db.json"
-for d in [LIVE_DIR, UPLOAD_DIR]: d.mkdir(parents=True, exist_ok=True)
 
+for d in [LIVE_DIR, UPLOAD_DIR]: 
+    d.mkdir(parents=True, exist_ok=True)
+
+# --- DATABASE HELPERS ---
 def load_db():
     if not DB_FILE.exists(): return {"media": [], "queue": []}
-    try: return json.loads(DB_FILE.read_text())
+    try:
+        content = DB_FILE.read_text()
+        return json.loads(content) if content else {"media": [], "queue": []}
     except: return {"media": [], "queue": []}
 
 def save_db(data):
     DB_FILE.write_text(json.dumps(data, indent=2))
 
-# --- YT-DLP HELPER ---
-def get_stream_url(url):
-    if not any(x in url for x in ["youtube.com", "youtu.be", "twitch.tv", "twitter.com"]):
-        return url # Direct CDN link
+# --- YT-DLP RESOLVER ---
+def resolve_url(url):
+    if not any(x in url for x in ["youtube.com", "youtu.be", "twitch.tv"]): return url
     try:
         ydl_opts = {'format': 'best[ext=mp4]/best', 'quiet': True, 'noplaylist': True}
         with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info['url']
+            return ydl.extract_info(url, download=False)['url']
     except Exception as e:
-        logger.error(f"URL Resolve Error: {e}")
+        logger.error(f"YT-DLP Error: {e}")
         return None
 
-# --- ENGINE ---
-class OverlordEngine:
+# --- ENGINE CORE ---
+class OverlordBroadcaster:
     def __init__(self):
         self.process = None
-        self.current_video = "IDLE"
+        self.current = "OFFLINE"
+        self.is_auto = True
         self.lock = threading.Lock()
 
-    def stop(self):
+    def kill(self):
         with self.lock:
             if self.process:
+                logger.info("Terminating FFmpeg...")
                 self.process.terminate()
-                self.process.wait()
+                try: self.process.wait(timeout=2)
+                except: self.process.kill()
                 self.process = None
-            self.current_video = "IDLE"
+            self.current = "OFFLINE"
 
     def start(self, source, title):
-        self.stop()
-        actual_url = get_stream_url(source)
-        if not actual_url: return
+        self.kill()
+        stream_url = resolve_url(source)
+        if not stream_url: 
+            logger.error(f"Could not resolve source: {source}")
+            return
         
-        # Render Optimized FFmpeg with Watermark
+        # PRO SETTINGS: Watermark + High Compression for Render Free Tier
         cmd = [
-            "ffmpeg", "-re", "-i", actual_url,
-            "-vf", "scale=-2:480,drawtext=text='ASHLABS LIVE':x=w-130:y=20:fontsize=20:fontcolor=white@0.6",
-            "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "700k", "-maxrate", "700k", "-bufsize", "1400k",
-            "-c:a", "aac", "-b:a", "64k", "-f", "hls", "-hls_time", "4", "-hls_list_size", "5",
-            "-hls_flags", "delete_segments+discont_start", str(LIVE_DIR / "index.m3u8"), "-y"
+            "ffmpeg", "-re", "-i", stream_url,
+            "-vf", "scale=-2:480,drawtext=text='ASHLABS LIVE':x=w-140:y=20:fontsize=20:fontcolor=white@0.7:box=1:boxcolor=black@0.4",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", 
+            "-b:v", "600k", "-maxrate", "600k", "-bufsize", "1200k",
+            "-c:a", "aac", "-b:a", "64k", "-ar", "44100",
+            "-f", "hls", "-hls_time", "4", "-hls_list_size", "5",
+            "-hls_flags", "delete_segments+discont_start", 
+            str(LIVE_DIR / "index.m3u8"), "-y"
         ]
+        
         with self.lock:
             self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.current_video = title
+            self.current = title
+            logger.info(f"Broadcast Started: {title}")
 
     def monitor(self):
+        """Infinite loop to handle playlist transitions"""
         while True:
-            db = load_db()
-            if db["queue"] and (not self.process or self.process.poll() is not None):
-                next_id = db["queue"].pop(0)
-                media = next((m for m in db["media"] if m["id"] == next_id), None)
-                if media:
-                    db["queue"].append(next_id) # Loop
-                    save_db(db)
-                    self.start(media["url"], media["title"])
+            if self.is_auto:
+                db = load_db()
+                # Start next if process is dead
+                if db["queue"] and (not self.process or self.process.poll() is not None):
+                    next_id = db["queue"].pop(0)
+                    media = next((m for m in db["media"] if m["id"] == next_id), None)
+                    if media:
+                        db["queue"].append(next_id) # Add back to end for infinite loop
+                        save_db(db)
+                        self.start(media["url"], media["title"])
             time.sleep(3)
 
-engine = OverlordEngine()
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# --- FASTAPI APP ---
+app = FastAPI(title="Ashlabs Overlord v3")
+
+# 🚨 THE CORS FIX: This allows your HTML page to talk to the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"], # Allow GET, POST, DELETE, etc.
+    allow_headers=["*"], # Allow all headers
+)
+
+engine = OverlordBroadcaster()
 app.mount("/stream", StaticFiles(directory=LIVE_DIR), name="stream")
 
 @app.on_event("startup")
-def startup(): threading.Thread(target=engine.monitor, daemon=True).start()
+def startup():
+    threading.Thread(target=engine.monitor, daemon=True).start()
 
-# --- API ---
+# --- API ENDPOINTS ---
+
 @app.get("/api/status")
-def status():
-    return {"current": engine.current_video, "cpu": psutil.cpu_percent(), "ram": psutil.virtual_memory().percent, "queue": load_db()["queue"]}
+def get_status():
+    return {
+        "is_live": engine.process is not None and engine.process.poll() is None,
+        "current": engine.current,
+        "cpu": psutil.cpu_percent(),
+        "ram": psutil.virtual_memory().percent,
+        "queue": load_db()["queue"]
+    }
+
+@app.get("/health")
+def health(): return {"status": "online"}
+
+@app.post("/api/control/stop")
+def stop_all():
+    engine.is_auto = False
+    engine.kill()
+    return {"status": "Broadcaster Stopped"}
+
+@app.post("/api/control/start")
+def start_auto():
+    engine.is_auto = True
+    return {"status": "Auto-Pilot Activated"}
+
+@app.post("/api/control/skip")
+def skip():
+    engine.kill()
+    return {"status": "Skipped to next track"}
+
+@app.get("/api/media")
+def list_media():
+    return load_db()["media"]
 
 @app.post("/api/media/remote")
 def add_remote(url: str, title: str):
     db = load_db()
     id = str(int(time.time()))
-    db["media"].append({"id": id, "title": f"🌐 {title}", "url": url})
+    db["media"].append({"id": id, "title": f"🔗 {title}", "url": url})
     save_db(db)
     return {"id": id}
+
+@app.post("/api/queue/add")
+def add_to_queue(id: str):
+    db = load_db()
+    if any(m["id"] == id for m in db["media"]):
+        db["queue"].append(id)
+        save_db(db)
+        return {"status": "Added"}
+    raise HTTPException(404, "Media ID not found")
 
 @app.post("/api/queue/reorder")
 def reorder_queue(order: List[str] = Body(...)):
     db = load_db()
     db["queue"] = order
     save_db(db)
-    return {"status": "Queue Updated"}
-
-@app.post("/api/queue/add")
-def add_queue(id: str):
-    db = load_db()
-    db["queue"].append(id)
-    save_db(db)
-    return {"status": "Added"}
-
-@app.post("/api/stream/skip")
-def skip(): engine.stop(); return {"status": "Skipped"}
-
-@app.get("/api/media")
-def list_media(): return load_db()["media"]
+    return {"status": "Reordered"}
 
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
     ts = str(int(time.time()))
-    path = UPLOAD_DIR / f"{ts}_{file.filename}"
-    with path.open("wb") as f: shutil.copyfileobj(file.file, f)
+    safe_filename = f"{ts}_{file.filename.replace(' ', '_')}"
+    path = UPLOAD_DIR / safe_filename
+    with path.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
     db = load_db()
-    db["media"].append({"id": ts, "title": file.filename, "url": f"static/uploads/{ts}_{file.filename}"})
+    db["media"].append({"id": ts, "title": file.filename, "url": f"static/uploads/{safe_filename}"})
     save_db(db)
     return {"status": "Uploaded"}
 
