@@ -1,6 +1,5 @@
 fastapi
 uvicorn
 psutil
-pydantic
 python-multipart
-httpx
+yt-dlp
